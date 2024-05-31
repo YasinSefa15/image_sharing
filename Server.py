@@ -1,100 +1,100 @@
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-import os
-import logging
-logging.basicConfig(filename='server.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+import socket
+import threading
+import pickle
 
-class Server:
-    def __init__(self):
-        self.users = {}
-        self.private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-        )
-        self.public_key = self.private_key.public_key()
-        self.image_store = {}
-        self.online_users = set()
+# Define server address and port
+SERVER_HOST = '127.0.0.1'
+SERVER_PORT = 65432
 
-    def store_image(self, owner_username, image_name, encrypted_image, digital_signature, encrypted_aes_key, iv):
-        # Resmi sunucuya kaydetme
-        if owner_username not in self.users:
-            raise ValueError("User must be registered to store images.")
+# Dictionary to store user information and their public keys
+users = {}
+# Dictionary to store images
+images = {}
 
-            # Store image details (log message, exclude large image data)
-        logging.info(f"STORE_IMAGE - Owner: {owner_username}, Image: {image_name}")
 
-        # Store image
-        self.image_store[image_name] = {
-            'owner': owner_username,
-            'encrypted_image': encrypted_image,
-            'encrypted_aes_key': encrypted_aes_key,
-            'iv': iv
-        }
-        self.notify_all_users(image_name, owner_username)
+def handle_client(client_socket, addr):
+    print(f"[NEW CONNECTION] {addr} connected.")
+    connected = True
+    while connected:
+        try:
+            message = client_socket.recv(4096)
+            if not message:
+                break
 
-    def get_public_key_pem(self):
-        # Sunucu açık anahtarını PEM formatında döndürme (simülasyon amaçlı)
-        return self.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
+            data = pickle.loads(message)
+            command = data['command']
 
-    def register_user(self, username, public_key_pem):
-        # Kullanıcıyı kaydetme ve sertifika oluşturma
-        public_key = serialization.load_pem_public_key(public_key_pem)
+            if command == 'REGISTER':
+                username = data['username']
+                public_key = data['public_key']
+                # The server would sign this key and create a certificate
+                certificate = f"cert-{username}"  # Placeholder for the actual certificate
+                users[username] = {'public_key': public_key, 'certificate': certificate}
+                response = {'status': 'REGISTERED', 'certificate': certificate}
+                client_socket.send(pickle.dumps(response))
+            elif command == 'POST_IMAGE':
+                image_name = data['image_name']
+                owner = data['owner']
+                encrypted_image = data['encrypted_image']
+                digital_signature = data['digital_signature']
+                encrypted_aes_key = data['encrypted_aes_key']
+                iv = data['iv']
 
-        self.users[username] = public_key
-        return public_key
+                images[image_name] = {
+                    'owner': owner,
+                    'encrypted_image': encrypted_image,
+                    'digital_signature': digital_signature,
+                    'encrypted_aes_key': encrypted_aes_key,
+                    'iv': iv
+                }
 
-    def notify_all_users(self, image_name, owner_username):
-        # Tüm çevrimiçi kullanıcılara yeni resim bildirimi gönderme
-        message = f"NEW_IMAGE {image_name} {owner_username}"
-        for user in self.online_users:
-            # Bildirimi göndermek için bir mekanizma eklenebilir (ör. websocket, e-posta, vb.)
-            print(f"Sending notification to {user}: {message}")
+                notification = {'command': 'NEW_IMAGE', 'image_name': image_name, 'owner': owner}
+                broadcast(notification)
+            elif command == 'DOWNLOAD':
+                image_name = data['image_name']
+                if image_name in images:
+                    image_data = images[image_name]
+                    response = {
+                        'status': 'IMAGE_FOUND',
+                        'image_data': image_data,
+                        'certificate': users[image_data['owner']]['certificate']
+                    }
+                    client_socket.send(pickle.dumps(response))
+                else:
+                    response = {'status': 'IMAGE_NOT_FOUND'}
+                    client_socket.send(pickle.dumps(response))
 
-    def add_online_user(self, username):
-        # Kullanıcıyı çevrimiçi kullanıcılar listesine ekleme
-        self.online_users.add(username)
+        except Exception as e:
+            print(f"Error: {e}")
+            connected = False
 
-    def remove_online_user(self, username):
-        # Kullanıcıyı çevrimdışı kullanıcılar listesine ekleme
-        self.online_users.remove(username)
+    client_socket.close()
+    print(f"[DISCONNECTED] {addr} disconnected.")
 
-    def download_image(self, image_name, requesting_user):
-        # Resim indirme işlemi
-        if image_name not in self.image_store:
-            print(f"Error: Image '{image_name}' not found on the server.")
-            return None
 
-        image_data = self.image_store[image_name]
-        owner_username = image_data['owner']
-        encrypted_image = image_data['encrypted_image']
-        digital_signature = image_data['digital_signature']
-        encrypted_aes_key = image_data['encrypted_aes_key']
-        iv = image_data['iv']
+def broadcast(message):
+    for client in clients:
+        try:
+            client.send(pickle.dumps(message))
+        except Exception as e:
+            print(f"Error sending broadcast: {e}")
 
-        # Kullanıcının sertifika ile doğrulanmış genel anahtarını al
-        owner_public_key = self.users.get(owner_username, None)
-        if not owner_public_key:
-            print(f"Error: Owner's public key not found for user '{owner_username}'.")
-            return None
 
-        # Kullanıcı için AES anahtarını sunucu tarafından şifrele
-        encrypted_requesting_user_aes_key = owner_public_key.encrypt(
-            requesting_user.aes_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind((SERVER_HOST, SERVER_PORT))
+server.listen()
+print(f"[LISTENING] Server is listening on {SERVER_HOST}:{SERVER_PORT}")
 
-        return {
-            'encrypted_image': encrypted_image,
-            'digital_signature': digital_signature,
-            'owner_public_key': owner_public_key,
-            'encrypted_requesting_user_aes_key': encrypted_requesting_user_aes_key,
-            'iv': iv
-        }
+clients = []
+
+
+def start():
+    while True:
+        client_socket, addr = server.accept()
+        clients.append(client_socket)
+        thread = threading.Thread(target=handle_client, args=(client_socket, addr))
+        thread.start()
+        print(f"[ACTIVE CONNECTIONS] {threading.active_count() - 1}")
+
+
+start()
